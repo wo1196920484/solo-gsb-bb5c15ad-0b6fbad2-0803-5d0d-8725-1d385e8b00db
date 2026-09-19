@@ -1,8 +1,10 @@
 # 邮件归档整理服务（FastAPI）
 
-批量提交邮件头信息（`message_id`、`in_reply_to`、`references`、发送时间、主题），
-服务将其归并为**稳定排序的会话树**，并给出**重复 ID、缺失引用、引用环**三类诊断。
-批次请求与归并结果均持久化到 SQLite，可随时查询。
+批量提交邮件头信息（`message_id`、`in_reply_to`、`references`、发送时间、主题，可选
+`retain_until` 保留截止时间），服务将其归并为**稳定排序的会话树**，并给出
+**重复 ID、缺失引用、引用环**三类诊断。批次请求与归并结果均持久化到 SQLite，可随时查询。
+支持按保留期**批量清理**到期邮件：可先**冻结**整棵会话加以保护，清理时保留节点自动
+重挂到最近的保留祖先。
 
 ## 一条命令启动
 
@@ -47,13 +49,18 @@ ports:
 | `GET` | `/batches?limit=50&offset=0` | 批次列表，按提交时间倒序 |
 | `GET` | `/batches/{batch_id}` | 取该批次的归档结果快照（与提交响应完全一致） |
 | `POST` | `/relinks` | 迟到邮件归档后，批量修复此前断链的有效邮件（HTTP 200） |
-| `GET` | `/messages/{message_id}` | 查询单封邮件及其最终父节点 |
+| `GET` | `/messages/{message_id}` | 查询单封邮件及其最终父节点、`retain_until` |
 | `GET` | `/threads/{message_id}` | 查询该邮件所属完整会话树；环邮件返回 **409** |
 | `GET` | `/threads/{message_id}/page?limit=&cursor=` | 会话树**游标分页**（先序扁平展开，含 `depth`），适配大型会话 |
+| `POST` | `/freezes` | 冻结某封有效邮件所属的整棵会话，使其免于清理（幂等） |
+| `GET` | `/freezes` | 列出当前全部冻结记录 |
+| `DELETE` | `/freezes/{message_id}` | 解除对某邮件所属会话的冻结 |
+| `POST` | `/cleanup` | 批量清理 `retain_until` 到期且未受冻结保护的有效邮件（支持 `dry_run`） |
 | `GET` | `/health` | 健康检查 |
 
-未知 ID：批次 / 邮件查询、`/relinks` 返回 **404**；请求体不合法返回 **422**；
-`/relinks` 若合并候选关系后形成环，整次返回 **409** 且不写库。
+未知 ID：批次 / 邮件查询、`/relinks`、`/freezes` 返回 **404**；请求体不合法返回 **422**；
+`/relinks` 若合并候选关系后形成环，整次返回 **409** 且不写库；冻结环内（invalid）邮件
+返回 **409**；解除未冻结的邮件返回 **404**。
 
 ### 大型会话分页：`GET /threads/{message_id}/page`
 
@@ -237,6 +244,87 @@ curl -X POST http://localhost:8000/relinks -H 'Content-Type: application/json' \
 }
 ```
 
+## 保留期清理与会话冻结
+
+每封邮件可在提交时可选填写 `retain_until`（保留截止时间，无时区按 UTC 处理，
+存储前统一归一化为 UTC；`GET /messages/{id}` 可查到归一化后的值）。到期清理的
+语义如下：
+
+- **冻结**：`POST /freezes` 冻结任一**有效**邮件时，其所属的**当前整棵会话**全部
+  受保护。保护范围按清理时锚点邮件所属的当前会话计算——补链并树、新邮件并入后，
+  保护范围随之扩大。重复冻结同一邮件为幂等操作（`already_frozen: true`）；
+  锚点邮件不存在返回 **404**，环内（invalid）邮件不属于任何会话，返回 **409**。
+- **解除冻结**：`DELETE /freezes/{message_id}` 删除冻结记录，会话即刻恢复可清理；
+  该邮件未冻结返回 **404**。
+- **清理**：`POST /cleanup` 筛出 `retain_until` **不晚于** `before`（截止时间，
+  必填，无时区按 UTC）且**未受冻结保护**的**有效**邮件（环内 invalid 邮件不参与），
+  在**单事务**内完成删除与重挂：
+  - 删除中间节点时，仍保留的后代重挂到**最近的保留祖先**；没有保留祖先则成为**新根**；
+  - 返回删除 ID 列表，以及每个被重挂节点的新旧父节点、新旧根节点
+    （父指针未变化的节点不在 `affected` 中）；
+  - `dry_run: true` 使用**同一算法**试算并返回相同结构的结果，但**不写库**；
+  - 清理后 `GET /threads`、`GET /messages` 与分页接口**立即**反映压缩后的结构；
+    清理前签发的分页游标因树 revision 变化而失效（**409** `cursor_stale`），
+    调用方从第一页重新开始即可；
+  - **既有批次结果快照（`GET /batches/{id}`）与诊断明细保持归档时原样，不做改写。**
+
+```bash
+# 1) 提交带保留期的会话链 A -> B -> C -> D（B、C 即将到期）
+curl -X POST http://localhost:8000/batches -H 'Content-Type: application/json' -d '{
+  "messages": [
+    {"message_id": "A", "in_reply_to": null, "references": [],
+     "sent_at": "2026-09-18T08:00:00Z", "subject": "例会通知"},
+    {"message_id": "B", "in_reply_to": "A", "references": ["A"],
+     "sent_at": "2026-09-18T09:00:00Z", "subject": "Re: 例会通知",
+     "retain_until": "2026-09-30T00:00:00Z"},
+    {"message_id": "C", "in_reply_to": "B", "references": ["A", "B"],
+     "sent_at": "2026-09-18T10:00:00Z", "subject": "Re: 例会通知",
+     "retain_until": "2026-09-30T00:00:00Z"},
+    {"message_id": "D", "in_reply_to": "C", "references": ["A", "B", "C"],
+     "sent_at": "2026-09-18T11:00:00Z", "subject": "Re: 例会通知"}
+  ]
+}'
+
+# 2) 先 dry_run 试算：同一算法，不写库
+curl -X POST http://localhost:8000/cleanup -H 'Content-Type: application/json' \
+  -d '{"before": "2026-10-01T00:00:00Z", "dry_run": true}'
+```
+
+```jsonc
+{
+  "dry_run": true,
+  "cutoff": "2026-10-01T00:00:00+00:00",
+  "protected_count": 0,               // 因冻结而免于清理的邮件数
+  "deleted_count": 2,
+  "deleted_message_ids": ["B", "C"],
+  "affected": [                        // 被重挂的保留节点
+    {"message_id": "D", "old_parent_id": "C", "new_parent_id": "A",
+     "old_root_id": "A", "new_root_id": "A"}
+  ]
+}
+```
+
+```bash
+# 3) 冻结 A 所在的整棵会话 -> 清理时全部受保护
+curl -X POST http://localhost:8000/freezes -H 'Content-Type: application/json' \
+  -d '{"message_id": "A"}'
+# => {"message_id":"A","root_id":"A","frozen_at":"…","protected_count":4,"already_frozen":false}
+
+curl http://localhost:8000/freezes        # 查看当前全部冻结记录
+curl -X POST http://localhost:8000/cleanup -H 'Content-Type: application/json' \
+  -d '{"before": "2026-10-01T00:00:00Z"}'
+# => protected_count=4，deleted_count=0（整棵会话受保护）
+
+# 4) 解除冻结后执行实际清理（单事务：重挂 + 删除一次提交）
+curl -X DELETE http://localhost:8000/freezes/A
+curl -X POST http://localhost:8000/cleanup -H 'Content-Type: application/json' \
+  -d '{"before": "2026-10-01T00:00:00Z"}'
+# => 删除 B、C；D 重挂到最近的保留祖先 A
+
+# 5) 会话查询立即反映压缩后的结构：A -> D
+curl http://localhost:8000/threads/D
+```
+
 ## 归并规则
 
 - **父节点确定**
@@ -261,12 +349,17 @@ curl -X POST http://localhost:8000/relinks -H 'Content-Type: application/json' \
 SQLite（WAL 模式），表在服务启动时自动创建：
 
 - `batches`：批次元数据与计数；
-- `messages`：每封唯一邮件、最终 `parent_id`、是否 `is_invalid`；
+- `messages`：每封唯一邮件、最终 `parent_id`、是否 `is_invalid`、可选 `retain_until`；
 - `batch_duplicates` / `batch_missing_refs` / `batch_cycles`：诊断明细；
 - `batch_results`：完整结果 JSON 快照，`GET /batches/{id}` 原样返回（补链只更新
-  `messages.parent_id`，快照与诊断表永不改写）。
+  `messages.parent_id`，清理只更新/删除 `messages` 行，快照与诊断表永不改写）；
+- `freezes`：会话冻结记录（锚点 `message_id`、冻结时的会话根、冻结时间）。
 
-写操作在进程内串行化（线程锁 + 单连接写事务），保证并发提交 / 补链下的归并一致性。
+既有数据库启动时自动做轻量迁移（为 `messages` 补 `retain_until` 列、建 `freezes` 表），
+无需手工干预。
+
+写操作在进程内串行化（线程锁 + 单连接写事务），保证并发提交 / 补链 / 冻结 / 清理下的
+归并一致性；实际清理的重挂与删除在同一事务内一次提交。
 
 ## 本地开发（不使用 Docker）
 

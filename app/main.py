@@ -13,9 +13,15 @@ from .schemas import (
     BatchIn,
     BatchResult,
     BatchSummary,
+    CleanupIn,
+    CleanupResult,
+    FreezeIn,
+    FreezeList,
+    FreezeOut,
     MessageOut,
     RelinkIn,
     RelinkResult,
+    UnfreezeOut,
 )
 
 
@@ -27,8 +33,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_title,
-    version="1.0.0",
-    description="批量提交邮件头信息，归并为稳定排序的会话树，诊断重复 ID / 缺失引用 / 引用环。",
+    version="1.1.0",
+    description="批量提交邮件头信息，归并为稳定排序的会话树，诊断重复 ID / 缺失引用 / 引用环；支持 retain_until 保留期、会话冻结与到期清理。",
     lifespan=lifespan,
 )
 
@@ -109,6 +115,57 @@ def get_message(message_id: str) -> dict:
     if msg is None:
         raise HTTPException(status_code=404, detail="message not found")
     return msg
+
+
+@app.post(
+    "/freezes",
+    response_model=FreezeOut,
+    tags=["retention"],
+    summary="冻结某封有效邮件所属的整棵会话（幂等）",
+)
+def freeze_message(payload: FreezeIn) -> dict:
+    try:
+        return service.freeze_message(payload)
+    except service.FreezeNotFound:
+        raise HTTPException(status_code=404, detail="message not found")
+    except service.FreezeInvalid:
+        raise HTTPException(
+            status_code=409,
+            detail="message belongs to a reference cycle and is not attached to any thread",
+        )
+
+
+@app.get(
+    "/freezes",
+    response_model=FreezeList,
+    tags=["retention"],
+    summary="列出当前全部冻结记录",
+)
+def list_freezes() -> dict:
+    return service.list_freezes()
+
+
+@app.delete(
+    "/freezes/{message_id}",
+    response_model=UnfreezeOut,
+    tags=["retention"],
+    summary="解除对某邮件所属会话的冻结",
+)
+def unfreeze_message(message_id: str) -> dict:
+    try:
+        return service.unfreeze_message(message_id)
+    except service.UnfreezeNotFound:
+        raise HTTPException(status_code=404, detail="message is not frozen")
+
+
+@app.post(
+    "/cleanup",
+    response_model=CleanupResult,
+    tags=["retention"],
+    summary="批量清理 retain_until 到期且未受冻结保护的有效邮件（支持 dry_run）",
+)
+def cleanup_expired(payload: CleanupIn) -> dict:
+    return service.cleanup_expired(payload)
 
 
 @app.get(

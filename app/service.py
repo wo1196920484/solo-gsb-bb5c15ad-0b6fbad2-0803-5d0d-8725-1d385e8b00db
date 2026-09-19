@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import database, threading
-from .schemas import BatchIn, RelinkIn
+from .schemas import BatchIn, CleanupIn, FreezeIn, RelinkIn
 from .threading import ThreadMessage
 
 
@@ -31,6 +31,30 @@ class RelinkCycleConflict(Exception):
     def __init__(self, cycles: list[list[str]]) -> None:
         self.cycles = cycles
         super().__init__(f"relink would create cycles: {cycles}")
+
+
+class FreezeNotFound(Exception):
+    """POST /freezes：锚点邮件未归档（-> 404）。"""
+
+    def __init__(self, message_id: str) -> None:
+        self.message_id = message_id
+        super().__init__(f"message not found: {message_id}")
+
+
+class FreezeInvalid(Exception):
+    """POST /freezes：锚点邮件在引用环内（invalid），不属于任何会话（-> 409）。"""
+
+    def __init__(self, message_id: str) -> None:
+        self.message_id = message_id
+        super().__init__(f"message is invalid and belongs to no thread: {message_id}")
+
+
+class UnfreezeNotFound(Exception):
+    """DELETE /freezes/{id}：该邮件没有冻结记录（-> 404）。"""
+
+    def __init__(self, message_id: str) -> None:
+        self.message_id = message_id
+        super().__init__(f"message is not frozen: {message_id}")
 
 
 class CursorMalformed(Exception):
@@ -252,8 +276,9 @@ def submit_batch(payload: BatchIn) -> dict:
                     """
                     INSERT INTO messages
                         (message_id, in_reply_to, "references", sent_at, subject,
-                         parent_id, is_invalid, batch_id, submitted_seq, archived_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         parent_id, is_invalid, batch_id, submitted_seq, archived_at,
+                         retain_until)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         m.message_id,
@@ -266,6 +291,7 @@ def submit_batch(payload: BatchIn) -> dict:
                         batch_id,
                         seq,
                         submitted_at,
+                        m.retain_until.isoformat() if m.retain_until is not None else None,
                     ),
                 )
 
@@ -503,7 +529,7 @@ def get_message(message_id: str) -> Optional[dict]:
     conn = database.connect()
     try:
         row = conn.execute(
-            'SELECT message_id, in_reply_to, "references", sent_at, subject, parent_id, is_invalid, batch_id FROM messages WHERE message_id = ?',
+            'SELECT message_id, in_reply_to, "references", sent_at, subject, parent_id, is_invalid, batch_id, retain_until FROM messages WHERE message_id = ?',
             (message_id,),
         ).fetchone()
         if row is None:
@@ -517,6 +543,7 @@ def get_message(message_id: str) -> Optional[dict]:
             "parent_id": row["parent_id"],
             "is_invalid": bool(row["is_invalid"]),
             "batch_id": row["batch_id"],
+            "retain_until": row["retain_until"],
         }
     finally:
         conn.close()
@@ -672,3 +699,205 @@ def get_thread_page(
         }
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 会话冻结 / 解除冻结 / 保留期清理
+# ---------------------------------------------------------------------------
+
+
+def freeze_message(payload: FreezeIn) -> dict:
+    """冻结锚点邮件所属的整棵会话：清理时该会话内所有有效邮件均受保护。
+
+    保护范围按清理时锚点邮件所属的当前整棵会话计算（补链并树、新邮件
+    并入后保护范围随之扩大）；重复冻结同一邮件为幂等操作。
+    """
+
+    mid = payload.message_id
+    with database.write_lock():
+        conn = database.connect()
+        try:
+            row = conn.execute(
+                "SELECT is_invalid FROM messages WHERE message_id = ?", (mid,)
+            ).fetchone()
+            if row is None:
+                raise FreezeNotFound(mid)
+            if row["is_invalid"]:
+                raise FreezeInvalid(mid)
+
+            existing = conn.execute(
+                "SELECT root_id, frozen_at FROM freezes WHERE message_id = ?", (mid,)
+            ).fetchone()
+            if existing is not None:
+                msgs, _ = _load_subtree(conn, _climb_root(conn, mid))
+                return {
+                    "message_id": mid,
+                    "root_id": existing["root_id"],
+                    "frozen_at": existing["frozen_at"],
+                    "protected_count": len(msgs),
+                    "already_frozen": True,
+                }
+
+            root_id = _climb_root(conn, mid)
+            frozen_at = _utc_now_iso()
+            conn.execute(
+                "INSERT INTO freezes (message_id, root_id, frozen_at) VALUES (?, ?, ?)",
+                (mid, root_id, frozen_at),
+            )
+            conn.commit()
+            msgs, _ = _load_subtree(conn, root_id)
+            return {
+                "message_id": mid,
+                "root_id": root_id,
+                "frozen_at": frozen_at,
+                "protected_count": len(msgs),
+                "already_frozen": False,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def unfreeze_message(message_id: str) -> dict:
+    """解除冻结：删除冻结记录，会话即刻恢复可清理。"""
+
+    with database.write_lock():
+        conn = database.connect()
+        try:
+            cur = conn.execute(
+                "DELETE FROM freezes WHERE message_id = ?", (message_id,)
+            )
+            if cur.rowcount == 0:
+                raise UnfreezeNotFound(message_id)
+            conn.commit()
+            return {"message_id": message_id, "unfrozen": True}
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def list_freezes() -> dict:
+    conn = database.connect()
+    try:
+        rows = conn.execute(
+            "SELECT message_id, root_id, frozen_at FROM freezes ORDER BY frozen_at, message_id"
+        ).fetchall()
+        return {
+            "total": len(rows),
+            "freezes": [
+                {
+                    "message_id": r["message_id"],
+                    "root_id": r["root_id"],
+                    "frozen_at": r["frozen_at"],
+                }
+                for r in rows
+            ],
+        }
+    finally:
+        conn.close()
+
+
+def cleanup_expired(payload: CleanupIn) -> dict:
+    """清理 retain_until 不晚于截止时间、且未受冻结保护的有效邮件。
+
+    - 仅处理有效邮件（is_invalid = 0）且 retain_until 非空、不晚于 before；
+    - 冻结锚点所属的当前整棵会话全部受保护，不参与删除；
+    - 删除中间节点时，仍保留的后代重挂到最近的保留祖先，无则成为新根；
+    - dry_run 走同一算法但不写库；实际清理在单事务内完成，
+      既有批次快照与诊断明细不受影响。
+    """
+
+    cutoff_iso = payload.before.isoformat()
+    with database.write_lock():
+        conn = database.connect()
+        try:
+            rows = conn.execute(
+                "SELECT message_id, parent_id, retain_until FROM messages WHERE is_invalid = 0"
+            ).fetchall()
+            parent_of: dict[str, Optional[str]] = {
+                r["message_id"]: r["parent_id"] for r in rows
+            }
+            children: dict[str, list[str]] = {}
+            for mid, pid in parent_of.items():
+                if pid is not None:
+                    children.setdefault(pid, []).append(mid)
+
+            # 冻结保护集：锚点邮件当前所属会话（整棵树）的全部节点
+            protected: set[str] = set()
+            for r in conn.execute("SELECT message_id FROM freezes").fetchall():
+                anchor = r["message_id"]
+                if anchor not in parent_of:
+                    continue  # 锚点已不存在（防御性；冻结中的邮件不会被清理）
+                stack = [_climb_root_inmem(anchor, parent_of)]
+                while stack:
+                    cur = stack.pop()
+                    if cur in protected:
+                        continue
+                    protected.add(cur)
+                    stack.extend(children.get(cur, ()))
+
+            deletable = sorted(
+                r["message_id"]
+                for r in rows
+                if r["retain_until"] is not None
+                and r["retain_until"] <= cutoff_iso
+                and r["message_id"] not in protected
+            )
+            deleted = set(deletable)
+
+            # 保留节点重挂：沿旧父指针找到最近的保留祖先，无则成为新根
+            new_parent_of: dict[str, Optional[str]] = {}
+            for mid in parent_of:
+                if mid in deleted:
+                    continue
+                cur = parent_of[mid]
+                while cur is not None and cur in deleted:
+                    cur = parent_of.get(cur)
+                new_parent_of[mid] = cur
+
+            affected: list[dict] = []
+            for mid in sorted(new_parent_of):
+                old_pid = parent_of[mid]
+                new_pid = new_parent_of[mid]
+                if old_pid == new_pid:
+                    continue
+                affected.append({
+                    "message_id": mid,
+                    "old_parent_id": old_pid,
+                    "new_parent_id": new_pid,
+                    "old_root_id": _climb_root_inmem(mid, parent_of),
+                    "new_root_id": _climb_root_inmem(mid, new_parent_of),
+                })
+
+            if not payload.dry_run:
+                # 单事务：先重挂保留节点，再删除到期节点，一次提交
+                for item in affected:
+                    conn.execute(
+                        "UPDATE messages SET parent_id = ? WHERE message_id = ?",
+                        (item["new_parent_id"], item["message_id"]),
+                    )
+                if deletable:
+                    conn.execute(
+                        "DELETE FROM messages WHERE message_id IN (%s)"
+                        % ",".join("?" * len(deletable)),
+                        deletable,
+                    )
+                conn.commit()
+
+            return {
+                "dry_run": payload.dry_run,
+                "cutoff": cutoff_iso,
+                "protected_count": len(protected),
+                "deleted_count": len(deletable),
+                "deleted_message_ids": deletable,
+                "affected": affected,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()

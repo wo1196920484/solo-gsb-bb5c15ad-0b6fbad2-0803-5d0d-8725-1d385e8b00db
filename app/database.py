@@ -32,11 +32,18 @@ CREATE TABLE IF NOT EXISTS messages (
     batch_id     TEXT NOT NULL,
     submitted_seq INTEGER NOT NULL,
     archived_at  TEXT NOT NULL,
+    retain_until TEXT,
     FOREIGN KEY (batch_id) REFERENCES batches(batch_id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_batch ON messages(batch_id);
 CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sent ON messages(sent_at);
+
+CREATE TABLE IF NOT EXISTS freezes (
+    message_id TEXT PRIMARY KEY,
+    root_id    TEXT NOT NULL,
+    frozen_at  TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS batch_duplicates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,16 +89,29 @@ def connect() -> sqlite3.Connection:
 
 
 def init_db(db_path: Optional[Path] = None) -> None:
-    """确保数据目录存在并执行建表 DDL（幂等）。"""
+    """确保数据目录存在并执行建表 DDL（幂等）；随后做轻量列迁移。"""
 
     path = db_path or settings.database_path
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     try:
         conn.executescript(DDL)
+        _migrate(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """为既有数据库补齐后续版本新增的列（CREATE TABLE IF NOT EXISTS 不管旧表）。"""
+
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    if "retain_until" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN retain_until TEXT")
+    # 列确认存在后再建索引（旧库上列可能刚由 ALTER 补齐）
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_retain ON messages(retain_until)"
+    )
 
 
 def write_lock() -> threading.Lock:
