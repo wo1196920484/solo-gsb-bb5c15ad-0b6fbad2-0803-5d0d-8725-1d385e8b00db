@@ -5,14 +5,18 @@ from __future__ import annotations
 import importlib
 
 
-def _m(mid, irt=None, refs=None, sent="2026-09-18T10:00:00+00:00", subject="hello"):
-    return {
+def _m(mid, irt=None, refs=None, sent="2026-09-18T10:00:00+00:00", subject="hello",
+       retain_until=None):
+    msg = {
         "message_id": mid,
         "in_reply_to": irt,
         "references": refs or [],
         "sent_at": sent,
         "subject": subject,
     }
+    if retain_until is not None:
+        msg["retain_until"] = retain_until
+    return msg
 
 
 def test_health(client):
@@ -590,3 +594,381 @@ def test_thread_page_endpoint_does_not_change_existing_thread_endpoint(client):
     assert tree["tree"]["message_id"] == "R"
     assert [c["message_id"] for c in tree["tree"]["children"]] == ["B", "D"]
     assert tree["tree"]["children"][0]["children"][0]["message_id"] == "C"
+
+
+# ---------------------------------------------------------------------------
+# retain_until：归档与查询
+# ---------------------------------------------------------------------------
+
+
+def test_retain_until_is_accepted_normalized_and_returned(client):
+    client.post("/batches", json={"messages": [
+        _m("A", retain_until="2026-09-20T10:00:00+00:00"),
+        _m("B", irt="A", refs=["A"], retain_until="2026-09-20T12:00:00"),  # naive -> UTC
+        _m("C", irt="A", refs=["A"]),  # 未设置
+    ]})
+    a = client.get("/messages/A").json()
+    assert a["retain_until"] == "2026-09-20T10:00:00Z"
+    assert a["frozen"] is False
+    b = client.get("/messages/B").json()
+    assert b["retain_until"] == "2026-09-20T12:00:00Z"  # naive -> UTC
+    c = client.get("/messages/C").json()
+    assert c["retain_until"] is None
+    assert c["frozen"] is False
+
+
+# ---------------------------------------------------------------------------
+# POST /retention/freezes、/retention/unfreezes
+# ---------------------------------------------------------------------------
+
+
+def _seed_retention_tree(client):
+    """R -> A -> C；R -> D。"""
+    client.post("/batches", json={"messages": [
+        _m("R", sent="2026-09-18T08:00:00+00:00"),
+        _m("A", irt="R", refs=["R"], sent="2026-09-18T09:00:00+00:00"),
+        _m("C", irt="A", refs=["R", "A"], sent="2026-09-18T10:00:00+00:00"),
+        _m("D", irt="R", refs=["R"], sent="2026-09-18T11:00:00+00:00"),
+    ]})
+
+
+def test_freeze_protects_whole_current_thread(client):
+    _seed_retention_tree(client)
+    r = client.post("/retention/freezes", json={"message_id": "C"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["anchor_id"] == "C"
+    assert body["root_id"] == "R"
+    assert body["created"] is True
+    # 成员按先序：R A C D
+    assert body["members"] == ["R", "A", "C", "D"]
+    assert "frozen_at" in body
+
+    assert client.get("/messages/R").json()["frozen"] is True
+    assert client.get("/messages/D").json()["frozen"] is True
+
+
+def test_freeze_refreshes_snapshot_when_thread_grows(client):
+    # 首次冻结时树只有 R -> A
+    client.post("/batches", json={"messages": [
+        _m("R", sent="2026-09-18T08:00:00+00:00"),
+        _m("A", irt="R", refs=["R"], sent="2026-09-18T09:00:00+00:00"),
+    ]})
+    first = client.post("/retention/freezes", json={"message_id": "A"}).json()
+    assert first["created"] is True
+    assert first["members"] == ["R", "A"]
+
+    # 新邮件并入同一会话；冻结快照不自动扩张
+    client.post("/batches", json={"messages": [
+        _m("D", irt="R", refs=["R"], sent="2026-09-18T11:00:00+00:00",
+           retain_until="2026-09-19T00:00:00+00:00"),
+    ]})
+    assert client.get("/messages/D").json()["frozen"] is False
+
+    # 再次冻结同一锚点 -> created=false，成员刷新
+    again = client.post("/retention/freezes", json={"message_id": "A"}).json()
+    assert again["created"] is False
+    assert again["members"] == ["R", "A", "D"]
+    assert client.get("/messages/D").json()["frozen"] is True
+
+
+def test_freeze_unknown_message_returns_404(client):
+    r = client.post("/retention/freezes", json={"message_id": "nope"})
+    assert r.status_code == 404
+
+
+def test_freeze_invalid_cycle_message_returns_409(client):
+    client.post("/batches", json={"messages": [
+        _m("x", irt="y", refs=["y"]),
+        _m("y", irt="x", refs=["x"]),
+    ]})
+    assert client.post("/retention/freezes", json={"message_id": "x"}).status_code == 409
+
+
+def test_freeze_blank_anchor_rejected(client):
+    assert client.post("/retention/freezes", json={"message_id": "   "}).status_code == 422
+
+
+def test_unfreeze_releases_members_and_is_idempotently_404(client):
+    _seed_retention_tree(client)
+    client.post("/retention/freezes", json={"message_id": "C"})
+    r = client.post("/retention/unfreezes", json={"message_id": "C"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["anchor_id"] == "C"
+    assert body["root_id"] == "R"
+    assert body["released_members"] == ["A", "C", "D", "R"]
+    assert body["still_protected"] == []
+    assert client.get("/messages/A").json()["frozen"] is False
+
+    assert client.post(
+        "/retention/unfreezes", json={"message_id": "C"}
+    ).status_code == 404
+
+
+def test_unfreeze_one_freeze_keeps_overlapping_protection(client):
+    _seed_retention_tree(client)
+    client.post("/retention/freezes", json={"message_id": "A"})
+    client.post("/retention/freezes", json={"message_id": "D"})
+
+    body = client.post(
+        "/retention/unfreezes", json={"message_id": "A"}
+    ).json()
+    # A 冻结释放后，所有成员仍被 D 冻结覆盖（同一棵树）
+    assert body["released_members"] == []
+    assert body["still_protected"] == ["A", "C", "D", "R"]
+    assert client.get("/messages/C").json()["frozen"] is True
+
+    body2 = client.post(
+        "/retention/unfreezes", json={"message_id": "D"}
+    ).json()
+    assert body2["released_members"] == ["A", "C", "D", "R"]
+    assert client.get("/messages/R").json()["frozen"] is False
+
+
+def test_unfreeze_unknown_anchor_returns_404(client):
+    assert client.post(
+        "/retention/unfreezes", json={"message_id": "ghost"}
+    ).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /retention/cleanups
+# ---------------------------------------------------------------------------
+
+
+def _seed_cleanup_forest(client):
+    """R(到期) -> A(到期) -> C(未到期) -> E(retain 更晚)；R -> D(到期, 冻结外另测)。"""
+    client.post("/batches", json={"messages": [
+        _m("R", sent="2026-09-18T08:00:00+00:00",
+           retain_until="2026-09-19T00:00:00+00:00"),
+        _m("A", irt="R", refs=["R"], sent="2026-09-18T09:00:00+00:00",
+           retain_until="2026-09-19T00:00:00+00:00"),
+        _m("C", irt="A", refs=["R", "A"], sent="2026-09-18T10:00:00+00:00"),
+        _m("E", irt="C", refs=["C"], sent="2026-09-18T10:30:00+00:00",
+           retain_until="2026-10-01T00:00:00+00:00"),
+        _m("D", irt="R", refs=["R"], sent="2026-09-18T11:00:00+00:00",
+           retain_until="2026-09-19T00:00:00+00:00"),
+    ]})
+
+
+CUTOFF = "2026-09-20T00:00:00+00:00"
+
+
+def test_dry_run_uses_same_plan_but_writes_nothing(client):
+    _seed_cleanup_forest(client)
+    r = client.post("/retention/cleanups", json={"cutoff": CUTOFF, "dry_run": True})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["dry_run"] is True
+    assert body["cutoff"] == "2026-09-20T00:00:00Z"
+    assert body["deleted_ids"] == ["A", "D", "R"]
+    assert body["deleted_count"] == 3
+    assert body["expired_count"] == 3  # R/A/D 到期；E retain 在 10 月，未到期
+    assert body["protected_count"] == 0
+
+    impact = {i["message_id"]: i for i in body["affected"]}
+    # R 被删 -> C 越过 A 成为新根；E 父仍为 C，但根 R -> C
+    assert impact["C"] == {
+        "message_id": "C", "old_parent_id": "A", "new_parent_id": None,
+        "old_root_id": "R", "new_root_id": "C",
+    }
+    assert impact["E"] == {
+        "message_id": "E", "old_parent_id": "C", "new_parent_id": "C",
+        "old_root_id": "R", "new_root_id": "C",
+    }
+    assert body["affected_count"] == 2
+
+    # dry_run 不写库：邮件都还在、结构不变
+    assert client.get("/messages/R").status_code == 200
+    assert client.get("/messages/C").json()["parent_id"] == "A"
+    tree = client.get("/threads/E").json()
+    assert tree["root_id"] == "R"
+
+
+def test_actual_cleanup_compresses_thread_immediately(client):
+    _seed_cleanup_forest(client)
+    body = client.post(
+        "/retention/cleanups", json={"cutoff": CUTOFF, "dry_run": False}
+    ).json()
+    assert body["dry_run"] is False
+    assert body["deleted_ids"] == ["A", "D", "R"]
+
+    # 删除的 ID 已不可查
+    for mid in ("R", "A", "D"):
+        assert client.get(f"/messages/{mid}").status_code == 404
+
+    # 存活结构：C 为新根，E 挂在 C 下
+    c = client.get("/messages/C").json()
+    assert c["parent_id"] is None
+    assert client.get("/messages/E").json()["parent_id"] == "C"
+    tree = client.get("/threads/E").json()
+    assert tree["root_id"] == "C"
+    assert tree["tree"]["message_id"] == "C"
+    assert [k["message_id"] for k in tree["tree"]["children"]] == ["E"]
+
+    flat = client.get("/threads/C/page", params={"limit": 50}).json()
+    assert [(i["message_id"], i["depth"]) for i in flat["items"]] == [
+        ("C", 0), ("E", 1),
+    ]
+
+
+def test_freeze_blocks_cleanup_of_protected_expired_thread(client):
+    _seed_cleanup_forest(client)
+    # 以 D 为锚冻结 -> 整棵树 R A C E D 全部受保护
+    fr = client.post("/retention/freezes", json={"message_id": "D"})
+    assert fr.status_code == 200
+    body = client.post(
+        "/retention/cleanups", json={"cutoff": CUTOFF}
+    ).json()
+    assert body["deleted_ids"] == []
+    assert body["protected_count"] == 3  # 到期的 R/A/D 全被保护
+    assert body["expired_count"] == 3
+    assert body["affected"] == []
+    assert client.get("/messages/R").status_code == 200
+
+
+def test_cleanup_only_deletes_subtree_outside_freeze(client):
+    _seed_cleanup_forest(client)
+    # 只冻结 C（冻结时其整棵当前会话其实是 R 树全体……），改为冻结另一棵树测试：
+    # 独立树 P(到期) -> Q(到期)；冻结 P 后 P/Q 均不删，主树照常压缩
+    client.post("/batches", json={"messages": [
+        _m("P", sent="2026-09-17T08:00:00+00:00",
+           retain_until="2026-09-19T00:00:00+00:00"),
+        _m("Q", irt="P", refs=["P"], sent="2026-09-17T09:00:00+00:00",
+           retain_until="2026-09-19T00:00:00+00:00"),
+    ]})
+    client.post("/retention/freezes", json={"message_id": "Q"})
+
+    body = client.post("/retention/cleanups", json={"cutoff": CUTOFF}).json()
+    assert body["deleted_ids"] == ["A", "D", "R"]
+    assert body["protected_count"] == 2  # P/Q 到期但被冻结
+    # 受冻结树原样保留
+    assert client.get("/messages/P").json()["parent_id"] is None
+    assert client.get("/messages/Q").json()["parent_id"] == "P"
+
+
+def test_cleanup_deletes_frozen_anchor_message_snapshot_does_not_apply_after_unfreeze(client):
+    _seed_cleanup_forest(client)
+    client.post("/retention/freezes", json={"message_id": "D"})
+    assert client.post(
+        "/retention/cleanups", json={"cutoff": CUTOFF}
+    ).json()["deleted_ids"] == []
+    # 解除冻结后同 cutoff 清理可正常删除
+    client.post("/retention/unfreezes", json={"message_id": "D"})
+    body = client.post("/retention/cleanups", json={"cutoff": CUTOFF}).json()
+    assert body["deleted_ids"] == ["A", "D", "R"]
+
+
+def test_cleanup_cutoff_boundary_is_inclusive(client):
+    client.post("/batches", json={"messages": [
+        _m("X", retain_until="2026-09-19T12:00:00+00:00"),
+        _m("Y", retain_until="2026-09-19T12:00:01+00:00"),
+    ]})
+    body = client.post(
+        "/retention/cleanups",
+        json={"cutoff": "2026-09-19T12:00:00+00:00"},
+    ).json()
+    # retain_until == cutoff 视为到期；晚一秒保留
+    assert body["deleted_ids"] == ["X"]
+
+
+def test_cleanup_without_retain_until_never_deletes(client):
+    client.post("/batches", json={"messages": [
+        _m("A"), _m("B", irt="A", refs=["A"]),
+    ]})
+    body = client.post(
+        "/retention/cleanups", json={"cutoff": "2030-01-01T00:00:00+00:00"}
+    ).json()
+    assert body["deleted_ids"] == []
+    assert body["expired_count"] == 0
+
+
+def test_cleanup_invalid_messages_are_never_touched(client):
+    # 环内 invalid 邮件即便带 retain_until 也不参与清理
+    client.post("/batches", json={"messages": [
+        _m("x", irt="y", refs=["y"], retain_until="2026-09-01T00:00:00+00:00"),
+        _m("y", irt="x", refs=["x"], retain_until="2026-09-01T00:00:00+00:00"),
+    ]})
+    body = client.post(
+        "/retention/cleanups", json={"cutoff": "2026-09-20T00:00:00+00:00"}
+    ).json()
+    assert body["deleted_ids"] == []
+    assert client.get("/messages/x").json()["is_invalid"] is True
+
+
+def test_cleanup_idempotent_second_run_is_noop(client):
+    _seed_cleanup_forest(client)
+    first = client.post("/retention/cleanups", json={"cutoff": CUTOFF}).json()
+    assert first["deleted_count"] == 3
+    second = client.post("/retention/cleanups", json={"cutoff": CUTOFF}).json()
+    assert second["deleted_ids"] == []
+    assert second["affected"] == []
+    assert second["expired_count"] == 0  # 剩余 C 无 retain_until、E retain 在 10 月
+    assert second["protected_count"] == 0
+
+
+def test_batch_snapshot_remains_unchanged_after_cleanup(client):
+    b = client.post("/batches", json={"messages": [
+        _m("R", retain_until="2026-09-19T00:00:00+00:00"),
+        _m("A", irt="R", refs=["R"], retain_until="2026-09-19T00:00:00+00:00"),
+    ]})
+    snap = b.json()
+    client.post("/retention/cleanups", json={"cutoff": CUTOFF})
+    # 快照原样返回（含已删除节点）
+    assert client.get(f"/batches/{snap['batch_id']}").json() == snap
+    assert [t["message_id"] for t in snap["threads"]] == ["R"]
+
+
+def test_paged_thread_cursor_is_stale_after_cleanup_compression(client):
+    _seed_cleanup_forest(client)
+    cur = client.get("/threads/R/page", params={"limit": 1}).json()["next_cursor"]
+    client.post("/retention/cleanups", json={"cutoff": CUTOFF})
+    # 旧游标基于已压缩前的树/根 R（已删除）；从存活节点重新翻页
+    stale = client.get("/threads/C/page", params={"limit": 1, "cursor": cur})
+    assert stale.status_code == 409
+    fresh = client.get("/threads/C/page", params={"limit": 50}).json()
+    assert [i["message_id"] for i in fresh["items"]] == ["C", "E"]
+    assert fresh["next_cursor"] is None
+
+
+def test_node_joining_thread_after_freeze_is_not_protected(client):
+    # 冻结时树为 R -> A；之后新邮件 N 到期并挂到被冻结的 A 下。
+    # 冻结只保护快照成员，N 不在其中；删除 N 时 A 存活，无重挂。
+    client.post("/batches", json={"messages": [
+        _m("R", sent="2026-09-18T08:00:00+00:00"),
+        _m("A", irt="R", refs=["R"], sent="2026-09-18T09:00:00+00:00"),
+    ]})
+    client.post("/retention/freezes", json={"message_id": "A"})
+    client.post("/batches", json={"messages": [
+        _m("N", irt="A", refs=["R", "A"], sent="2026-09-18T12:00:00+00:00",
+           retain_until="2026-09-19T00:00:00+00:00"),
+    ]})
+    assert client.get("/messages/N").json()["frozen"] is False
+
+    body = client.post("/retention/cleanups", json={"cutoff": CUTOFF}).json()
+    assert body["deleted_ids"] == ["N"]
+    assert body["affected"] == []
+    # 被冻结的 R/A 原样保留
+    assert client.get("/messages/A").json()["parent_id"] == "R"
+    tree = client.get("/threads/R").json()
+    assert tree["root_id"] == "R"
+    assert [c["message_id"] for c in tree["tree"]["children"]] == ["A"]
+
+
+def test_cleanup_freeze_member_rows_survive_and_unfreeze_after_cleanup(client):
+    # R(到期) 被冻结保护 -> 清理不删；解除冻结后再清理
+    client.post("/batches", json={"messages": [
+        _m("R", retain_until="2026-09-19T00:00:00+00:00"),
+        _m("A", irt="R", refs=["R"]),
+    ]})
+    client.post("/retention/freezes", json={"message_id": "A"})
+    client.post("/retention/cleanups", json={"cutoff": CUTOFF})
+    unf = client.post("/retention/unfreezes", json={"message_id": "A"})
+    assert unf.status_code == 200
+    assert unf.json()["released_members"] == ["A", "R"]
+    body = client.post("/retention/cleanups", json={"cutoff": CUTOFF}).json()
+    assert body["deleted_ids"] == ["R"]
+    impact = {i["message_id"]: i for i in body["affected"]}
+    assert impact["A"]["new_parent_id"] is None
+    assert impact["A"]["new_root_id"] == "A"

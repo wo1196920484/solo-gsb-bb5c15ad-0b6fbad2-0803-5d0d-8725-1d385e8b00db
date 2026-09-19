@@ -321,3 +321,147 @@ def build_flat_tree(
     for root in roots:
         items.extend(to_item(root, 0))
     return items
+
+
+# ---------------------------------------------------------------------------
+# 保留期清理：到期删除 + 会话压缩（纯逻辑，dry_run 与实际清理共用）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CleanupImpact:
+    """一个存活节点在压缩前后的父节点 / 根节点。"""
+
+    message_id: str
+    old_parent_id: Optional[str]
+    new_parent_id: Optional[str]
+    old_root_id: str
+    new_root_id: str
+
+
+@dataclass(frozen=True)
+class RetentionCleanupPlan:
+    """一次保留期清理的完整结论。
+
+    deleted_ids 与 impacts 均已按 message_id 稳定排序；expired_ids 为
+    全部到期有效邮件，protected_expired_ids 为其中“到期且被冻结保护”
+    的子集，二者之差即实际删除集。
+    """
+
+    deleted_ids: list[str]
+    impacts: list[CleanupImpact]
+    expired_ids: frozenset[str]
+    protected_expired_ids: frozenset[str]
+
+
+def plan_retention_cleanup(
+    parent_of: dict[str, Optional[str]],
+    expired_ids: set[str],
+    protected_ids: set[str],
+) -> RetentionCleanupPlan:
+    """在当前有效邮件森林上计算到期清理与压缩结果。
+
+    - 删除集 = 到期邮件中未被冻结保护者（删除集之外的节点全部存活）；
+    - 存活节点若父节点被删，则沿父链向上跳过全部被删节点，重挂到
+      最近的存活祖先；链顶没有存活祖先时成为新根；
+    - 根节点不变的判定基于压缩后的父指针：祖先链中间被删只改父指针，
+      根节点被删则整棵剩余子树的根随之改变。
+
+    入参 parent_of 只包含有效邮件（环内 invalid 邮件从不参与），
+    expired_ids 中不属于该森林的 ID 会被忽略。
+    """
+
+    valid_ids = set(parent_of)
+    expired_valid = {mid for mid in expired_ids if mid in valid_ids}
+    protected_expired = expired_valid & set(protected_ids)
+    delete_set = expired_valid - set(protected_ids)
+    if not delete_set:
+        return RetentionCleanupPlan(
+            deleted_ids=[],
+            impacts=[],
+            expired_ids=frozenset(expired_valid),
+            protected_expired_ids=frozenset(protected_expired),
+        )
+
+    survivors = valid_ids - delete_set
+
+    # 旧根（压缩前）：沿父指针上溯
+    def old_root_of(mid: str) -> str:
+        cur = mid
+        seen: set[str] = set()
+        while True:
+            pid = parent_of.get(cur)
+            if pid is None or pid not in valid_ids or pid in seen:
+                return cur
+            seen.add(cur)
+            cur = pid
+
+    old_root: dict[str, str] = {mid: old_root_of(mid) for mid in survivors}
+
+    # 新父：沿父链跳过被删节点，找最近存活祖先；无则成根（None）。
+    # 记忆化：最近存活祖先只取决于父链上更靠上的节点，先把父链节点
+    # 收集起来，再自顶向下回填，保证每个节点只走一遍链。
+    new_parent: dict[str, Optional[str]] = {}
+
+    def resolve(mid: str) -> Optional[str]:
+        if mid in new_parent:
+            return new_parent[mid]
+        chain: list[str] = []
+        cur = mid
+        seen: set[str] = set()
+        # 收集父链直到根、穿出森林、回到已解析节点（防御性：遇环也停）
+        while (
+            cur is not None
+            and cur in valid_ids
+            and cur not in new_parent
+            and cur not in seen
+        ):
+            chain.append(cur)
+            seen.add(cur)
+            cur = parent_of.get(cur)
+        inherited = new_parent.get(cur) if cur is not None else None
+        for node in reversed(chain):
+            pid = parent_of.get(node)
+            if pid is None or pid not in valid_ids:
+                inherited = None
+            elif pid not in delete_set:
+                inherited = pid
+            # pid 被删 => inherited 保持为已解析出的最近存活祖先
+            new_parent[node] = inherited
+        return new_parent[mid]
+
+    for mid in survivors:
+        resolve(mid)
+
+    # 新根（压缩后）：在新父指针上一次上溯
+    def new_root_of(mid: str) -> str:
+        cur = mid
+        seen: set[str] = set()
+        while True:
+            pid = new_parent.get(cur)
+            if pid is None or pid in seen:
+                return cur
+            seen.add(cur)
+            cur = pid
+
+    new_root: dict[str, str] = {mid: new_root_of(mid) for mid in survivors}
+
+    impacts: list[CleanupImpact] = []
+    for mid in survivors:
+        op, nr = new_parent[mid], new_root[mid]
+        if op != parent_of.get(mid) or nr != old_root[mid]:
+            impacts.append(CleanupImpact(
+                message_id=mid,
+                old_parent_id=parent_of.get(mid),
+                new_parent_id=op,
+                old_root_id=old_root[mid],
+                new_root_id=nr,
+            ))
+    impacts.sort(key=lambda i: i.message_id)
+
+    return RetentionCleanupPlan(
+        deleted_ids=sorted(delete_set),
+        impacts=impacts,
+        expired_ids=frozenset(expired_valid),
+        protected_expired_ids=frozenset(protected_expired),
+    )

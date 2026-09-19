@@ -13,9 +13,15 @@ from .schemas import (
     BatchIn,
     BatchResult,
     BatchSummary,
+    CleanupIn,
+    CleanupResult,
+    FreezeIn,
+    FreezeResult,
     MessageOut,
     RelinkIn,
     RelinkResult,
+    UnfreezeIn,
+    UnfreezeResult,
 )
 
 
@@ -27,8 +33,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_title,
-    version="1.0.0",
-    description="批量提交邮件头信息，归并为稳定排序的会话树，诊断重复 ID / 缺失引用 / 引用环。",
+    version="1.1.0",
+    description=(
+        "批量提交邮件头信息，归并为稳定排序的会话树，诊断重复 ID / 缺失引用 / 引用环；"
+        "支持邮件保留期（retain_until）、会话冻结/解除冻结与到期批量清理。"
+    ),
     lifespan=lifespan,
 )
 
@@ -163,3 +172,51 @@ def get_thread_page(
             detail="message belongs to a reference cycle and is not attached to any thread",
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# 保留期：会话冻结 / 解除冻结 / 批量清理
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/retention/freezes",
+    response_model=FreezeResult,
+    tags=["retention"],
+    summary="冻结某封有效邮件当前所在的整棵会话，使其不被保留期清理删除",
+)
+def freeze_thread(payload: FreezeIn) -> dict:
+    try:
+        return service.freeze_thread(payload)
+    except service.RetentionAnchorNotFound:
+        raise HTTPException(status_code=404, detail="message not found")
+    except service.RetentionAnchorInvalid:
+        raise HTTPException(
+            status_code=409,
+            detail="message belongs to a reference cycle and is not attached to any thread",
+        )
+
+
+@app.post(
+    "/retention/unfreezes",
+    response_model=UnfreezeResult,
+    tags=["retention"],
+    summary="解除以某封邮件为锚点的会话冻结",
+)
+def unfreeze_thread(payload: UnfreezeIn) -> dict:
+    try:
+        return service.unfreeze_thread(payload)
+    except service.RetentionFreezeNotFound:
+        raise HTTPException(
+            status_code=404, detail="no freeze found anchored at this message"
+        )
+
+
+@app.post(
+    "/retention/cleanups",
+    response_model=CleanupResult,
+    tags=["retention"],
+    summary="批量清理截止时间前已到期且未受冻结保护的有效邮件（可 dry_run 预览）",
+)
+def cleanup_messages(payload: CleanupIn) -> dict:
+    return service.cleanup_messages(payload)

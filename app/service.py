@@ -13,8 +13,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import database, threading
-from .schemas import BatchIn, RelinkIn
-from .threading import ThreadMessage
+from .schemas import BatchIn, CleanupIn, FreezeIn, RelinkIn, UnfreezeIn
+from .threading import RetentionCleanupPlan, ThreadMessage
 
 
 class RelinkNotFound(Exception):
@@ -43,6 +43,18 @@ class CursorThreadMismatch(Exception):
 
 class CursorStale(Exception):
     """游标 revision / 根归属与当前树不一致（树在补链中变化，-> 409）。"""
+
+
+class RetentionAnchorNotFound(Exception):
+    """冻结/解冻锚点邮件未归档（-> 404）。"""
+
+
+class RetentionAnchorInvalid(Exception):
+    """冻结锚点是引用环内 invalid 邮件，不属于任何会话（-> 409）。"""
+
+
+class RetentionFreezeNotFound(Exception):
+    """解除冻结：不存在以该邮件为锚点的冻结（-> 404）。"""
 
 
 # 游标载荷版本号；编码结构调整时可据此区分。
@@ -252,8 +264,9 @@ def submit_batch(payload: BatchIn) -> dict:
                     """
                     INSERT INTO messages
                         (message_id, in_reply_to, "references", sent_at, subject,
-                         parent_id, is_invalid, batch_id, submitted_seq, archived_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         parent_id, is_invalid, batch_id, submitted_seq, archived_at,
+                         retain_until)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         m.message_id,
@@ -266,6 +279,7 @@ def submit_batch(payload: BatchIn) -> dict:
                         batch_id,
                         seq,
                         submitted_at,
+                        m.retain_until.isoformat() if m.retain_until else None,
                     ),
                 )
 
@@ -503,11 +517,15 @@ def get_message(message_id: str) -> Optional[dict]:
     conn = database.connect()
     try:
         row = conn.execute(
-            'SELECT message_id, in_reply_to, "references", sent_at, subject, parent_id, is_invalid, batch_id FROM messages WHERE message_id = ?',
+            'SELECT message_id, in_reply_to, "references", sent_at, subject, parent_id, is_invalid, batch_id, retain_until FROM messages WHERE message_id = ?',
             (message_id,),
         ).fetchone()
         if row is None:
             return None
+        frozen = conn.execute(
+            "SELECT 1 FROM retention_freeze_members WHERE message_id = ? LIMIT 1",
+            (message_id,),
+        ).fetchone()
         return {
             "message_id": row["message_id"],
             "in_reply_to": row["in_reply_to"],
@@ -517,6 +535,8 @@ def get_message(message_id: str) -> Optional[dict]:
             "parent_id": row["parent_id"],
             "is_invalid": bool(row["is_invalid"]),
             "batch_id": row["batch_id"],
+            "retain_until": row["retain_until"],
+            "frozen": frozen is not None,
         }
     finally:
         conn.close()
@@ -647,6 +667,15 @@ def get_thread_page(
                 # 游标根是当前树内节点（补链并树后下沉为子节点）：树已变 -> 409
                 if cursor_root in msgs:
                     raise CursorStale("cursor revision is stale; restart from the first page")
+                # 游标根已被保留期清理删除（同一谱系被压缩）：树已变 -> 409
+                ghost = conn.execute(
+                    "SELECT 1 FROM messages WHERE message_id = ?", (cursor_root,)
+                ).fetchone()
+                if ghost is None:
+                    raise CursorStale(
+                        "cursor root has been removed by retention cleanup; "
+                        "restart from the first page"
+                    )
                 # 游标根不属于路径所属会话 -> 422
                 raise CursorThreadMismatch(
                     "cursor does not belong to the thread of the path message_id"
@@ -672,3 +701,241 @@ def get_thread_page(
         }
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 保留期：会话冻结 / 解除冻结 / 批量清理
+# ---------------------------------------------------------------------------
+
+
+def _load_protected_ids(conn: sqlite3.Connection) -> set[str]:
+    """当前被任一冻结覆盖的全部成员 ID（多冻结取并集）。"""
+
+    return {
+        r["message_id"]
+        for r in conn.execute("SELECT DISTINCT message_id FROM retention_freeze_members")
+    }
+
+
+def freeze_thread(payload: FreezeIn) -> dict:
+    """冻结锚点邮件当前所在的整棵会话。
+
+    冻结只保护“冻结时刻”的成员快照：之后新并入该会话的邮件不受保护，
+    需再次以该锚点冻结来刷新快照。锚点不存在 -> 404；锚点为环内
+    invalid 邮件（不属于任何会话树）-> 409。
+    """
+
+    anchor_id = payload.message_id
+    with database.write_lock():
+        conn = database.connect()
+        try:
+            row = conn.execute(
+                "SELECT is_invalid FROM messages WHERE message_id = ?",
+                (anchor_id,),
+            ).fetchone()
+            if row is None:
+                raise RetentionAnchorNotFound("message not found")
+            if row["is_invalid"]:
+                raise RetentionAnchorInvalid(
+                    "message belongs to a reference cycle and is not attached to any thread"
+                )
+
+            root_id = _climb_root(conn, anchor_id)
+            msgs, parents = _load_subtree(conn, root_id)
+            # 成员顺序与会话查询/分页一致：稳定排序的先序
+            members = [item["message_id"] for item in threading.build_flat_tree(msgs, parents)]
+
+            existing = conn.execute(
+                "SELECT frozen_at FROM retention_freezes WHERE anchor_id = ?",
+                (anchor_id,),
+            ).fetchone()
+            frozen_at = _utc_now_iso()
+            if existing is None:
+                created = True
+                conn.execute(
+                    "INSERT INTO retention_freezes (anchor_id, frozen_at) VALUES (?, ?)",
+                    (anchor_id, frozen_at),
+                )
+            else:
+                created = False
+                conn.execute(
+                    "UPDATE retention_freezes SET frozen_at = ? WHERE anchor_id = ?",
+                    (frozen_at, anchor_id),
+                )
+                # 刷新成员快照：清掉旧成员后按当前会话重写
+                conn.execute(
+                    "DELETE FROM retention_freeze_members WHERE anchor_id = ?",
+                    (anchor_id,),
+                )
+            conn.executemany(
+                "INSERT INTO retention_freeze_members (anchor_id, message_id) VALUES (?, ?)",
+                [(anchor_id, mid) for mid in members],
+            )
+            conn.commit()
+            return {
+                "anchor_id": anchor_id,
+                "root_id": root_id,
+                "frozen_at": frozen_at,
+                "created": created,
+                "members": members,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def unfreeze_thread(payload: UnfreezeIn) -> dict:
+    """解除以锚点邮件建立的冻结，仅释放该冻结独占的保护。"""
+
+    anchor_id = payload.message_id
+    with database.write_lock():
+        conn = database.connect()
+        try:
+            row = conn.execute(
+                "SELECT frozen_at FROM retention_freezes WHERE anchor_id = ?",
+                (anchor_id,),
+            ).fetchone()
+            if row is None:
+                raise RetentionFreezeNotFound("freeze not found for anchor message")
+            frozen_at = row["frozen_at"]
+
+            members = [
+                r["message_id"]
+                for r in conn.execute(
+                    "SELECT message_id FROM retention_freeze_members WHERE anchor_id = ? ORDER BY message_id",
+                    (anchor_id,),
+                )
+            ]
+
+            # 冻结记录里的根 ID：沿当前父指针上溯（锚点永不会被清理删除）
+            root_id = _climb_root(conn, anchor_id)
+
+            conn.execute(
+                "DELETE FROM retention_freezes WHERE anchor_id = ?",
+                (anchor_id,),
+            )
+            # ON DELETE CASCADE 在独立连接级 PRAGMA 下已开启；这里不依赖它，显式删成员
+            conn.execute(
+                "DELETE FROM retention_freeze_members WHERE anchor_id = ?",
+                (anchor_id,),
+            )
+
+            placeholders = ",".join("?" * len(members))
+            still_protected = (
+                [
+                    r["message_id"]
+                    for r in conn.execute(
+                        f"SELECT DISTINCT message_id FROM retention_freeze_members WHERE message_id IN ({placeholders}) ORDER BY message_id",
+                        members,
+                    )
+                ]
+                if members
+                else []
+            )
+            released_members = [mid for mid in members if mid not in set(still_protected)]
+
+            conn.commit()
+            return {
+                "anchor_id": anchor_id,
+                "root_id": root_id,
+                "frozen_at": frozen_at,
+                "released_members": released_members,
+                "still_protected": still_protected,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def _build_cleanup_plan(
+    conn: sqlite3.Connection, cutoff_iso: str
+) -> tuple[RetentionCleanupPlan, dict[str, Optional[str]]]:
+    """读取当前有效邮件森林并计算到期清理计划（dry_run 与实跑共用）。"""
+
+    rows = conn.execute(
+        "SELECT message_id, parent_id FROM messages WHERE is_invalid = 0"
+    ).fetchall()
+    parent_of: dict[str, Optional[str]] = {r["message_id"]: r["parent_id"] for r in rows}
+
+    expired_rows = conn.execute(
+        "SELECT message_id FROM messages WHERE is_invalid = 0 AND retain_until IS NOT NULL AND retain_until <= ?",
+        (cutoff_iso,),
+    ).fetchall()
+    expired_ids = {r["message_id"] for r in expired_rows}
+    protected_ids = _load_protected_ids(conn)
+
+    plan = threading.plan_retention_cleanup(parent_of, expired_ids, protected_ids)
+    return plan, parent_of
+
+
+def cleanup_messages(payload: CleanupIn) -> dict:
+    """批量清理截止时刻前已到期、且未被冻结保护的有效邮件。
+
+    筛出删除集后先在内存父指针图上做整林压缩（最近存活祖先重挂 /
+    提升为新根），dry_run 返回同一算法结论但不写库；实际清理在单事务
+    内完成全部 DELETE 与 parent_id UPDATE。
+    """
+
+    cutoff_dt = payload.normalized_cutoff() or datetime.now(timezone.utc)
+    cutoff_iso = cutoff_dt.isoformat()
+
+    if payload.dry_run:
+        conn = database.connect()
+        try:
+            plan, _ = _build_cleanup_plan(conn, cutoff_iso)
+        finally:
+            conn.close()
+        return _cleanup_result(payload.dry_run, cutoff_dt, plan)
+
+    with database.write_lock():
+        conn = database.connect()
+        try:
+            plan, _ = _build_cleanup_plan(conn, cutoff_iso)
+
+            # 单事务：先重挂存活后代，再删除到期节点
+            for impact in plan.impacts:
+                conn.execute(
+                    "UPDATE messages SET parent_id = ? WHERE message_id = ?",
+                    (impact.new_parent_id, impact.message_id),
+                )
+            if plan.deleted_ids:
+                placeholders = ",".join("?" * len(plan.deleted_ids))
+                conn.execute(
+                    f"DELETE FROM messages WHERE message_id IN ({placeholders})",
+                    plan.deleted_ids,
+                )
+            conn.commit()
+            return _cleanup_result(payload.dry_run, cutoff_dt, plan)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def _cleanup_result(
+    dry_run: bool, cutoff_dt: datetime, plan: RetentionCleanupPlan
+) -> dict:
+    return {
+        "dry_run": dry_run,
+        "cutoff": cutoff_dt.isoformat(),
+        "deleted_ids": plan.deleted_ids,
+        "affected": [
+            {
+                "message_id": impact.message_id,
+                "old_parent_id": impact.old_parent_id,
+                "new_parent_id": impact.new_parent_id,
+                "old_root_id": impact.old_root_id,
+                "new_root_id": impact.new_root_id,
+            }
+            for impact in plan.impacts
+        ],
+        "deleted_count": len(plan.deleted_ids),
+        "affected_count": len(plan.impacts),
+        "expired_count": len(plan.expired_ids),
+        "protected_count": len(plan.protected_expired_ids),
+    }

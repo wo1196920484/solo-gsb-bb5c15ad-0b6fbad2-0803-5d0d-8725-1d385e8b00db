@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from app.threading import ThreadMessage, build_flat_tree, build_forest, resolve_batch
+from app.threading import (
+    ThreadMessage,
+    build_flat_tree,
+    build_forest,
+    plan_retention_cleanup,
+    resolve_batch,
+)
 
 
 def msg(mid, irt=None, refs=(), sent="2026-09-18T00:00:00+00:00", subj="s"):
@@ -219,3 +225,118 @@ def test_build_flat_tree_matches_forest_preorder_and_depth():
 
 def test_build_flat_tree_empty_when_no_messages():
     assert build_flat_tree({}, {}) == []
+
+
+# ---------------------------------------------------------------------------
+# plan_retention_cleanup：到期删除 + 会话压缩（纯逻辑）
+# ---------------------------------------------------------------------------
+
+
+def _impact_map(plan):
+    return {i.message_id: i for i in plan.impacts}
+
+
+def test_cleanup_deletes_expired_leaves_and_keeps_unexpired():
+    # R -> A(到期) -> C(未到期)；D(无 retain_until) 挂在 R 下
+    parent_of = {"R": None, "A": "R", "C": "A", "D": "R"}
+    plan = plan_retention_cleanup(parent_of, expired_ids={"A"}, protected_ids=set())
+
+    assert plan.deleted_ids == ["A"]
+    assert plan.expired_ids == frozenset({"A"})
+    assert plan.protected_expired_ids == frozenset()
+    impacts = _impact_map(plan)
+    # C 重挂到最近存活祖先 R；根不变
+    c = impacts["C"]
+    assert (c.old_parent_id, c.new_parent_id, c.old_root_id, c.new_root_id) == (
+        "A", "R", "R", "R",
+    )
+    # R/D 未受影响
+    assert "R" not in impacts and "D" not in impacts
+
+
+def test_cleanup_deleting_middle_of_chain_skips_to_nearest_surviving_ancestor():
+    # R -> B(到期) -> C(到期) -> D -> E
+    parent_of = {"R": None, "B": "R", "C": "B", "D": "C", "E": "D"}
+    plan = plan_retention_cleanup(
+        parent_of, expired_ids={"B", "C"}, protected_ids=set()
+    )
+    assert plan.deleted_ids == ["B", "C"]
+    impacts = _impact_map(plan)
+    # D 跳过 C、B，重挂到 R；E 父是仍存活的 D，故 E 根不变、父不变
+    d = impacts["D"]
+    assert d.new_parent_id == "R"
+    assert d.old_root_id == "R" and d.new_root_id == "R"
+    assert "E" not in impacts
+
+
+def test_cleanup_deleting_root_promotes_subtree_to_new_roots():
+    # R(到期) -> B -> C；整棵树删除根后，B 成为新根；C 父不变但根变化
+    parent_of = {"R": None, "B": "R", "C": "B"}
+    plan = plan_retention_cleanup(parent_of, expired_ids={"R"}, protected_ids=set())
+    assert plan.deleted_ids == ["R"]
+    impacts = _impact_map(plan)
+    b = impacts["B"]
+    assert (b.old_parent_id, b.new_parent_id, b.old_root_id, b.new_root_id) == (
+        "R", None, "R", "B",
+    )
+    c = impacts["C"]
+    assert (c.old_parent_id, c.new_parent_id, c.old_root_id, c.new_root_id) == (
+        "B", "B", "R", "B",
+    )
+
+
+def test_cleanup_delete_entire_tree_leaves_no_impacts():
+    parent_of = {"R": None, "A": "R", "B": "A"}
+    plan = plan_retention_cleanup(
+        parent_of, expired_ids={"R", "A", "B"}, protected_ids=set()
+    )
+    assert plan.deleted_ids == ["A", "B", "R"]
+    assert plan.impacts == []
+
+
+def test_cleanup_protected_expired_messages_are_not_deleted():
+    # R(到期但冻结) -> A(到期)；保护 R 后 A 删除，A 的子节点无；R 存活
+    parent_of = {"R": None, "A": "R", "B": "A"}
+    plan = plan_retention_cleanup(
+        parent_of, expired_ids={"R", "A"}, protected_ids={"R"}
+    )
+    assert plan.deleted_ids == ["A"]
+    assert plan.protected_expired_ids == frozenset({"R"})
+    impacts = _impact_map(plan)
+    # B 重挂到被保护而存活的 R；根仍是 R
+    b = impacts["B"]
+    assert (b.old_parent_id, b.new_parent_id, b.old_root_id, b.new_root_id) == (
+        "A", "R", "R", "R",
+    )
+
+
+def test_cleanup_deletes_disjoint_subtrees_independently():
+    # 两棵独立树：R1->A(到期)->D；R2(到期)->E
+    parent_of = {"R1": None, "A": "R1", "D": "A", "R2": None, "E": "R2"}
+    plan = plan_retention_cleanup(
+        parent_of, expired_ids={"A", "R2"}, protected_ids=set()
+    )
+    assert plan.deleted_ids == ["A", "R2"]
+    impacts = _impact_map(plan)
+    # D 重挂 R1，根不变
+    assert impacts["D"].new_parent_id == "R1"
+    assert (impacts["D"].old_root_id, impacts["D"].new_root_id) == ("R1", "R1")
+    # E 失去根 R2，自成新根
+    assert (impacts["E"].old_parent_id, impacts["E"].new_parent_id) == ("R2", None)
+    assert (impacts["E"].old_root_id, impacts["E"].new_root_id) == ("R2", "E")
+
+
+def test_cleanup_without_expired_messages_is_noop():
+    parent_of = {"R": None, "A": "R"}
+    plan = plan_retention_cleanup(parent_of, expired_ids=set(), protected_ids=set())
+    assert plan.deleted_ids == [] and plan.impacts == []
+
+
+def test_cleanup_expired_foreign_ids_are_ignored():
+    parent_of = {"R": None}
+    plan = plan_retention_cleanup(
+        parent_of, expired_ids={"ghost", "R"}, protected_ids={"ghost2"}
+    )
+    assert plan.deleted_ids == ["R"]
+    assert plan.expired_ids == frozenset({"R"})
+    assert plan.protected_expired_ids == frozenset()

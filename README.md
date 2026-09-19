@@ -1,8 +1,10 @@
 # 邮件归档整理服务（FastAPI）
 
-批量提交邮件头信息（`message_id`、`in_reply_to`、`references`、发送时间、主题），
-服务将其归并为**稳定排序的会话树**，并给出**重复 ID、缺失引用、引用环**三类诊断。
-批次请求与归并结果均持久化到 SQLite，可随时查询。
+批量提交邮件头信息（`message_id`、`in_reply_to`、`references`、发送时间、主题，
+以及可选的保留截止时间 `retain_until`），服务将其归并为**稳定排序的会话树**，
+并给出**重复 ID、缺失引用、引用环**三类诊断。批次请求与归并结果均持久化到 SQLite，
+可随时查询。此外支持**会话冻结 / 解除冻结**与按保留期的**到期批量清理**
+（删除中间节点时自动压缩会话树，支持 `dry_run` 预览）。
 
 ## 一条命令启动
 
@@ -47,13 +49,21 @@ ports:
 | `GET` | `/batches?limit=50&offset=0` | 批次列表，按提交时间倒序 |
 | `GET` | `/batches/{batch_id}` | 取该批次的归档结果快照（与提交响应完全一致） |
 | `POST` | `/relinks` | 迟到邮件归档后，批量修复此前断链的有效邮件（HTTP 200） |
-| `GET` | `/messages/{message_id}` | 查询单封邮件及其最终父节点 |
+| `GET` | `/messages/{message_id}` | 查询单封邮件及其最终父节点（含 `retain_until` 与 `frozen` 状态） |
 | `GET` | `/threads/{message_id}` | 查询该邮件所属完整会话树；环邮件返回 **409** |
 | `GET` | `/threads/{message_id}/page?limit=&cursor=` | 会话树**游标分页**（先序扁平展开，含 `depth`），适配大型会话 |
+| `POST` | `/retention/freezes` | **冻结**某封有效邮件当前所在的整棵会话 |
+| `POST` | `/retention/unfreezes` | **解除**以某封邮件为锚点的冻结 |
+| `POST` | `/retention/cleanups` | **批量清理**截止时间前到期、且未受冻结保护的有效邮件（可 `dry_run`） |
 | `GET` | `/health` | 健康检查 |
 
+提交邮件时每封邮件可选填 `retain_until`（UTC 归一，无时区按 UTC 处理）；
+`retain_until` 早于或等于清理 `cutoff` 即视为到期。环内 `invalid` 邮件
+不参与冻结与清理。
+
 未知 ID：批次 / 邮件查询、`/relinks` 返回 **404**；请求体不合法返回 **422**；
-`/relinks` 若合并候选关系后形成环，整次返回 **409** 且不写库。
+`/relinks` 若合并候选关系后形成环，整次返回 **409** 且不写库。冻结锚点未知
+返回 **404**，锚点为环内邮件返回 **409**；解除一个不存在的冻结返回 **404**。
 
 ### 大型会话分页：`GET /threads/{message_id}/page`
 
@@ -170,6 +180,10 @@ curl -X POST http://localhost:8000/batches \
 }
 ```
 
+> 会话树节点（`threads` 与分页 `items`）沿用固定字段集，不内嵌
+> `retain_until` / 冻结状态——这两项通过 `GET /messages/{id}` 查询；批次快照
+> 的结构因此保持稳定，归档后永不改写。
+
 ### 迟到邮件补链：`POST /relinks`
 
 邮件归档时若 `in_reply_to` / `references` 指向的邮件尚未到达，该邮件会断链自成根。
@@ -237,6 +251,131 @@ curl -X POST http://localhost:8000/relinks -H 'Content-Type: application/json' \
 }
 ```
 
+## 保留期：冻结与到期清理
+
+归档时可给邮件设置可选的 `retain_until`（保留截止时间）：
+
+```bash
+curl -X POST http://localhost:8000/batches \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messages": [
+      {"message_id": "A", "in_reply_to": null, "references": [],
+       "sent_at": "2026-09-10T08:00:00Z", "subject": "季度公告",
+       "retain_until": "2026-10-01T00:00:00Z"},
+      {"message_id": "B", "in_reply_to": "A", "references": ["A"],
+       "sent_at": "2026-09-10T09:00:00Z", "subject": "Re: 季度公告",
+       "retain_until": "2026-09-15T00:00:00Z"},
+      {"message_id": "C", "in_reply_to": "B", "references": ["A", "B"],
+       "sent_at": "2026-09-10T10:00:00Z", "subject": "Re: 季度公告"}
+    ]
+  }'
+```
+
+`GET /messages/{id}` 会返回 `retain_until`，以及该邮件当前是否处于冻结保护
+（`frozen`）。
+
+### 冻结 / 解除冻结：`POST /retention/freezes`、`POST /retention/unfreezes`
+
+以会话内**任意一封有效邮件为锚点**发起冻结，会冻结其**当前所在的整棵会话**
+（冻结时刻的成员快照，按先序返回）：
+
+```bash
+# 以深层邮件 C 为锚点：A、B、C 全部进入保护
+curl -X POST http://localhost:8000/retention/freezes \
+  -H 'Content-Type: application/json' -d '{"message_id": "C"}'
+```
+
+```json
+{
+  "anchor_id": "C",
+  "root_id": "A",
+  "frozen_at": "2026-09-19T03:00:00Z",
+  "created": true,
+  "members": ["A", "B", "C"]
+}
+```
+
+冻结语义：
+
+- 冻结**只保护冻结时刻的会话成员快照**：此后新归档并挂入该会话的邮件不受保护；
+  对同一锚点再次调用即为**刷新**（`created: false`），按当前会话重写成员快照；
+- 同一棵会话可以由不同锚点多次冻结，保护取**并集**；
+- 锚点邮件不存在返回 **404**；锚点是引用环内 `invalid` 邮件（不属于任何会话）
+  返回 **409**。
+
+解除冻结以**锚点 ID** 调用（冻结成员不是锚点，不能代为解除）：
+
+```bash
+curl -X POST http://localhost:8000/retention/unfreezes \
+  -H 'Content-Type: application/json' -d '{"message_id": "C"}'
+```
+
+```jsonc
+{
+  "anchor_id": "C",
+  "root_id": "A",
+  "frozen_at": "2026-09-19T03:00:00Z",
+  "released_members": ["A", "B", "C"],   // 不再被任何冻结覆盖的成员
+  "still_protected": []                  // 仍被其它冻结覆盖的成员（多冻结重叠时）
+}
+```
+
+不存在以该邮件为锚点的冻结时返回 **404**。
+
+### 批量清理：`POST /retention/cleanups`
+
+请求体给出截止时刻 `cutoff`（缺省为当前 UTC）与 `dry_run` 开关：
+
+- 删除条件：`is_invalid = 0`（有效邮件）**且** `retain_until` 非空
+  **且** `retain_until <= cutoff`（边界包含）**且**不被任何冻结成员快照覆盖；
+- 未设置 `retain_until` 的邮件永不因到期被删；环内 `invalid` 邮件从不参与；
+- **会话压缩**：删除节点后，仍保留的后代沿父链跳过全部被删节点，重挂到
+  **最近的保留祖先**；链顶没有存活祖先时**成为新根**；
+- 响应返回删除 ID（`deleted_ids`）以及每个受影响存活节点的
+  `old_parent_id` / `new_parent_id` / `old_root_id` / `new_root_id`
+  （祖先链中间被删只改父指针；根被删时整棵剩余子树的根随之改变）；
+- `dry_run: true` 与实际清理**使用完全相同的算法**，只计算并返回结果、**不写库**；
+- 实际清理在**单事务**内完成全部重挂与删除，要么全部生效、要么全部回滚；
+- 清理后 `GET /threads`、`GET /threads/.../page`、`GET /messages` **立即**反映
+  压缩后的结构（压缩前领取的分页游标会收到 **409** `cursor_stale`，重新从首页
+  开始即可）；**既有批次结果快照 `GET /batches/{id}` 永不改写**，即使其中的
+  节点已被删除。
+
+先预览（`dry_run`，不写库）：
+
+```bash
+curl -X POST http://localhost:8000/retention/cleanups \
+  -H 'Content-Type: application/json' \
+  -d '{"cutoff": "2026-09-20T00:00:00Z", "dry_run": true}'
+```
+
+对上例（B 到期；A 保留到 10 月；C 未设保留期）：
+
+```jsonc
+{
+  "dry_run": true,
+  "cutoff": "2026-09-20T00:00:00Z",
+  "deleted_ids": ["B"],
+  "affected": [
+    {
+      "message_id": "C",
+      "old_parent_id": "B",
+      "new_parent_id": "A",   // 中间节点 B 被删 -> C 重挂到最近保留祖先 A
+      "old_root_id": "A",
+      "new_root_id": "A"
+    }
+  ],
+  "deleted_count": 1,
+  "affected_count": 1,
+  "expired_count": 1,         // 有效邮件中已到期的数量
+  "protected_count": 0        // 已到期但被冻结保护的数量
+}
+```
+
+确认后去掉 `dry_run`（或置 `false`）实际执行；重复执行是幂等的——已删除的
+节点不会再出现，新到期前的第二次调用为空操作。
+
 ## 归并规则
 
 - **父节点确定**
@@ -261,12 +400,17 @@ curl -X POST http://localhost:8000/relinks -H 'Content-Type: application/json' \
 SQLite（WAL 模式），表在服务启动时自动创建：
 
 - `batches`：批次元数据与计数；
-- `messages`：每封唯一邮件、最终 `parent_id`、是否 `is_invalid`；
+- `messages`：每封唯一邮件、最终 `parent_id`、是否 `is_invalid`、可选 `retain_until`；
 - `batch_duplicates` / `batch_missing_refs` / `batch_cycles`：诊断明细；
-- `batch_results`：完整结果 JSON 快照，`GET /batches/{id}` 原样返回（补链只更新
-  `messages.parent_id`，快照与诊断表永不改写）。
+- `batch_results`：完整结果 JSON 快照，`GET /batches/{id}` 原样返回（补链、保留期
+  清理只更新/删除 `messages`，快照与诊断表永不改写）；
+- `retention_freezes` / `retention_freeze_members`：冻结锚点与会话成员快照。
 
-写操作在进程内串行化（线程锁 + 单连接写事务），保证并发提交 / 补链下的归并一致性。
+写操作在进程内串行化（线程锁 + 单连接写事务），保证并发提交 / 补链 / 冻结 /
+清理下的归并一致性；保留期实际清理的全部重挂与删除在**单个事务**内提交。
+
+服务启动的建表 DDL 幂等；早期数据库（`messages` 无 `retain_until` 列、无冻结表）
+会在启动时自动补列、补表并建立保留期索引，无需手工迁移。
 
 ## 本地开发（不使用 Docker）
 
