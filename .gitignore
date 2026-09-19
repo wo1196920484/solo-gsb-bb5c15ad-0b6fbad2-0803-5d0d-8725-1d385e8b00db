@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# 本地 SQLite 数据
+data/
+*.db
+*.db-wal
+*.db-shm
